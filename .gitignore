@@ -1,0 +1,15 @@
+# Ignore all files in these directories but keep the folder structure
+base_cards/**/*
+!base_cards/**/.gitkeep
+
+fonts/**/*
+!fonts/**/.gitkeep
+
+invites/**/*
+!invites/**/.gitkeep
+
+# Virtual environment
+venv/
+
+# Generated names file
+names.csv
