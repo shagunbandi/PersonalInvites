@@ -13,3 +13,11 @@ venv/
 
 # Generated names file
 names.csv
+
+# Generated work allocation PDFs
+workAllotment/work/
+workAllotment/work.csv
+
+invites.zip
+
+.DS_Store
