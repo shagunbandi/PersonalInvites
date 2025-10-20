@@ -1,7 +1,7 @@
 import csv
 import os
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.pagesizes import A4
 from reportlab.platypus import (
     SimpleDocTemplate,
     Table,
@@ -9,11 +9,16 @@ from reportlab.platypus import (
     Paragraph,
     Spacer,
     PageBreak,
+    HRFlowable,
 )
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
+from PyPDF2 import PdfReader, PdfWriter
+from io import BytesIO
 
 
 def read_work_csv(csv_path):
@@ -61,32 +66,30 @@ def filter_columns(header, rows):
     """Filter out completely empty columns but always keep headers"""
     has_content = get_non_empty_columns(header, rows)
 
-    # Keep columns that have content
-    filtered_header = [header[i] for i in range(len(header)) if has_content[i]]
+    # Skip specific columns: 1st (index 0), 6th (index 5), 10th (index 9)
+    columns_to_skip = {0, 5, 9}
+
+    # Keep columns that have content and are not in the skip list
+    filtered_header = [
+        header[i]
+        for i in range(len(header))
+        if has_content[i] and i not in columns_to_skip
+    ]
     filtered_rows = []
 
-    last_was_empty = False
     for row in rows:
         if is_empty_row(row):
-            # Only add one empty row if there are consecutive empty rows
-            # and only if we already have some content (not at the beginning)
-            if not last_was_empty and filtered_rows:
-                filtered_rows.append([""] * len(filtered_header))
-                last_was_empty = True
+            # Skip all empty rows
+            continue
         else:
             filtered_row = []
             for i in range(len(header)):
-                if has_content[i]:
+                if has_content[i] and i not in columns_to_skip:
                     if i < len(row):
                         filtered_row.append(row[i])
                     else:
                         filtered_row.append("")
             filtered_rows.append(filtered_row)
-            last_was_empty = False
-
-    # Remove trailing empty row if present
-    if filtered_rows and is_empty_row(filtered_rows[-1]):
-        filtered_rows.pop()
 
     return filtered_header, filtered_rows
 
@@ -135,7 +138,144 @@ def organize_work_by_person(rows):
     return header, person_work
 
 
-def create_pdf_for_person(person_name, header, rows, output_path):
+class WatermarkCanvas(canvas.Canvas):
+    """Custom canvas that adds a watermark to each page"""
+
+    def __init__(self, *args, **kwargs):
+        self.logo_path = kwargs.pop("logo_path", None)
+        self._watermark_image = None
+        canvas.Canvas.__init__(self, *args, **kwargs)
+        # Preload the watermark image
+        if self.logo_path and os.path.exists(self.logo_path):
+            self._load_watermark()
+
+    def _load_watermark(self):
+        """Load and prepare the watermark image once"""
+        try:
+            from PIL import Image
+
+            # Check if file is PDF or image
+            if self.logo_path.lower().endswith(".pdf"):
+                from pdf2image import convert_from_path
+
+                # Convert first page of PDF to image
+                images = convert_from_path(
+                    self.logo_path, first_page=1, last_page=1, dpi=150
+                )
+                if images:
+                    # Save to BytesIO to use with ImageReader
+                    img_buffer = BytesIO()
+                    images[0].save(img_buffer, format="PNG")
+                    img_buffer.seek(0)
+
+                    self._watermark_image = ImageReader(img_buffer)
+                    self._watermark_size = images[0].size
+            else:
+                # Load image directly (PNG, JPG, etc.)
+                img = Image.open(self.logo_path)
+                self._watermark_image = ImageReader(self.logo_path)
+                self._watermark_size = img.size
+        except Exception as e:
+            print(f"Warning: Could not load watermark: {e}")
+            self._watermark_image = None
+
+    def showPage(self):
+        """Override showPage to finalize the page"""
+        canvas.Canvas.showPage(self)
+
+    def _drawBeforeContent(self):
+        """Draw the watermark BEFORE any content"""
+        if self._watermark_image is None:
+            return
+
+        self.saveState()
+
+        # Set transparency (0.0 = transparent, 1.0 = opaque)
+        self.setFillAlpha(0.6)  # 60% opacity for better visibility
+        self.setStrokeAlpha(0.6)
+
+        # Get page dimensions
+        page_width, page_height = A4
+
+        try:
+            img_width, img_height = self._watermark_size
+
+            # Scale logo to fit centered on page (use 60% of page size)
+            scale = min(
+                (page_width * 0.6) / img_width, (page_height * 0.6) / img_height
+            )
+            scaled_width = img_width * scale
+            scaled_height = img_height * scale
+
+            # Center the logo on the page
+            x = (page_width - scaled_width) / 2
+            y = (page_height - scaled_height) / 2
+
+            # Draw the logo
+            self.drawImage(
+                self._watermark_image,
+                x,
+                y,
+                width=scaled_width,
+                height=scaled_height,
+                mask="auto",
+                preserveAspectRatio=True,
+            )
+        except Exception as e:
+            print(f"Warning: Could not draw watermark in old canvas: {e}")
+
+        self.restoreState()
+
+    def _startPage(self):
+        """Override _startPage to draw watermark first"""
+        canvas.Canvas._startPage(self)
+        self._drawBeforeContent()
+
+
+def add_watermark_to_page(canvas_obj, doc, logo_path):
+    """Add watermark to a page using canvas callback"""
+    try:
+        from PIL import Image
+
+        # Load the logo
+        img = Image.open(logo_path)
+        img_reader = ImageReader(logo_path)
+        img_width, img_height = img.size
+
+        # Get page dimensions
+        page_width, page_height = A4
+
+        # Scale logo to fit centered on page (use 60% of page size)
+        scale = min((page_width * 0.6) / img_width, (page_height * 0.6) / img_height)
+        scaled_width = img_width * scale
+        scaled_height = img_height * scale
+
+        # Center the logo on the page
+        x = (page_width - scaled_width) / 2
+        y = (page_height - scaled_height) / 2
+
+        # Save state and set transparency
+        canvas_obj.saveState()
+        canvas_obj.setFillAlpha(0.1)  # 50% opacity so watermark shows on top
+        canvas_obj.setStrokeAlpha(0.1)
+
+        # Draw the logo
+        canvas_obj.drawImage(
+            img_reader,
+            x,
+            y,
+            width=scaled_width,
+            height=scaled_height,
+            mask="auto",
+            preserveAspectRatio=True,
+        )
+
+        canvas_obj.restoreState()
+    except Exception as e:
+        print(f"Error adding watermark: {e}")
+
+
+def create_pdf_for_person(person_name, header, rows, output_path, logo_path=None):
     """Create a PDF with work items for a specific person"""
     # Filter out empty columns first
     filtered_header, filtered_rows = filter_columns(header, rows)
@@ -143,25 +283,46 @@ def create_pdf_for_person(person_name, header, rows, output_path):
     # Create the PDF document
     doc = SimpleDocTemplate(
         output_path,
-        pagesize=landscape(A4),
+        pagesize=A4,
         rightMargin=0.4 * inch,
         leftMargin=0.4 * inch,
         topMargin=0.5 * inch,
         bottomMargin=0.4 * inch,
     )
 
+    # Set up watermark callback if logo exists
+    watermark_func = None
+    if logo_path and os.path.exists(logo_path):
+        watermark_func = lambda c, d: add_watermark_to_page(c, d, logo_path)
+
     # Container for the 'Flowable' objects
     elements = []
 
     # Define styles
     styles = getSampleStyleSheet()
+
+    # Main title style with decorative line
     title_style = ParagraphStyle(
         "CustomTitle",
         parent=styles["Heading1"],
-        fontSize=14,
-        textColor=colors.HexColor("#1a1a1a"),
+        fontSize=18,
+        textColor=colors.HexColor("#2C3E50"),
+        spaceAfter=8,
+        spaceBefore=4,
+        alignment=1,  # Center alignment
+        fontName="Helvetica-Bold",
+    )
+
+    # Subtitle style for "Work Allocation"
+    subtitle_style = ParagraphStyle(
+        "SubtitleStyle",
+        parent=styles["Normal"],
+        fontSize=10,
+        textColor=colors.HexColor("#7F8C8D"),
         spaceAfter=12,
         alignment=1,  # Center alignment
+        fontName="Helvetica",
+        letterSpacing=2,
     )
 
     # Style for table cells with wrapping
@@ -183,10 +344,36 @@ def create_pdf_for_person(person_name, header, rows, output_path):
         alignment=1,  # Center
     )
 
-    # Add title
-    title = Paragraph(f"Work Allocation - {person_name}", title_style)
-    elements.append(title)
-    elements.append(Spacer(1, 0.1 * inch))
+    # Add beautiful title with person's name
+    elements.append(Spacer(1, 0.05 * inch))
+    subtitle = Paragraph("WORK ALLOCATION", subtitle_style)
+    elements.append(subtitle)
+
+    # Add decorative line
+    line = HRFlowable(
+        width="30%",
+        thickness=1,
+        color=colors.HexColor("#3498DB"),
+        spaceAfter=8,
+        spaceBefore=2,
+        hAlign="CENTER",
+    )
+    elements.append(line)
+
+    # Add person's name as main title
+    name_title = Paragraph(person_name, title_style)
+    elements.append(name_title)
+
+    # Add another decorative line
+    line2 = HRFlowable(
+        width="30%",
+        thickness=1,
+        color=colors.HexColor("#3498DB"),
+        spaceAfter=12,
+        spaceBefore=8,
+        hAlign="CENTER",
+    )
+    elements.append(line2)
 
     # Prepare data for the table with Paragraph objects for wrapping
     table_data = []
@@ -197,23 +384,19 @@ def create_pdf_for_person(person_name, header, rows, output_path):
 
     # Add data rows with Paragraphs
     for row in filtered_rows:
-        if is_empty_row(row):
-            # Empty divider row
-            table_data.append([""] * len(filtered_header))
-        else:
-            # Wrap each cell in a Paragraph for text wrapping
-            formatted_row = []
-            for cell in row:
-                cell_text = str(cell).strip()
-                if cell_text:
-                    formatted_row.append(Paragraph(cell_text, cell_style))
-                else:
-                    formatted_row.append("")
-            table_data.append(formatted_row)
+        # Wrap each cell in a Paragraph for text wrapping
+        formatted_row = []
+        for cell in row:
+            cell_text = str(cell).strip()
+            if cell_text:
+                formatted_row.append(Paragraph(cell_text, cell_style))
+            else:
+                formatted_row.append("")
+        table_data.append(formatted_row)
 
     # Create the table
     # Calculate column widths based on content
-    page_width = landscape(A4)[0] - 0.8 * inch
+    page_width = A4[0] - 0.8 * inch
     num_cols = len(filtered_header)
 
     # Create a mapping of column names to their preferred widths
@@ -225,8 +408,8 @@ def create_pdf_for_person(person_name, header, rows, output_path):
         "THINGS TO DO": 1.8 * inch,
         "PAYMENT": 0.6 * inch,
         "CONTACT": 0.7 * inch,
-        "FOLLOW UP": 1.0 * inch,
-        "Work Head": 0.65 * inch,
+        "FOLLOW UP": 1.8 * inch,  # Increased width for multiple names
+        "Work Head": 0.45 * inch,  # Reduced width for short labels
         "LIST": 0.45 * inch,
     }
 
@@ -256,7 +439,7 @@ def create_pdf_for_person(person_name, header, rows, output_path):
 
     table = Table(table_data, colWidths=col_widths, repeatRows=1)
 
-    # Add style to the table
+    # Add style to the table with transparent backgrounds so watermark shows through
     table_style = TableStyle(
         [
             # Header style
@@ -264,8 +447,7 @@ def create_pdf_for_person(person_name, header, rows, output_path):
             ("ALIGN", (0, 0), (-1, 0), "CENTER"),
             ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
             ("TOPPADDING", (0, 0), (-1, 0), 8),
-            # Data rows style
-            ("BACKGROUND", (0, 1), (-1, -1), colors.white),
+            # Data rows style - NO BACKGROUND so watermark shows through
             ("ALIGN", (0, 1), (-1, -1), "LEFT"),
             ("TOPPADDING", (0, 1), (-1, -1), 4),
             ("BOTTOMPADDING", (0, 1), (-1, -1), 4),
@@ -274,28 +456,17 @@ def create_pdf_for_person(person_name, header, rows, output_path):
             # Grid
             ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            # Alternating row colors for better readability
-            (
-                "ROWBACKGROUNDS",
-                (0, 1),
-                (-1, -1),
-                [colors.white, colors.HexColor("#F2F2F2")],
-            ),
         ]
     )
-
-    # Add special styling for empty rows (dividers)
-    for i, row in enumerate(filtered_rows, start=1):  # Start at 1 to skip header
-        if is_empty_row(row):
-            table_style.add("BACKGROUND", (0, i), (-1, i), colors.HexColor("#D9D9D9"))
-            table_style.add("LINEABOVE", (0, i), (-1, i), 2, colors.HexColor("#808080"))
-            table_style.add("LINEBELOW", (0, i), (-1, i), 2, colors.HexColor("#808080"))
 
     table.setStyle(table_style)
     elements.append(table)
 
-    # Build the PDF
-    doc.build(elements)
+    # Build the PDF with watermark callback
+    if watermark_func:
+        doc.build(elements, onFirstPage=watermark_func, onLaterPages=watermark_func)
+    else:
+        doc.build(elements)
     print(f"Generated PDF for {person_name}: {output_path}")
 
 
@@ -304,9 +475,16 @@ def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     csv_path = os.path.join(script_dir, "work.csv")
     output_dir = os.path.join(script_dir, "work")
+    logo_path = os.path.join(script_dir, "logo.png")
 
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
+
+    # Check if logo exists
+    if os.path.exists(logo_path):
+        print(f"Found logo at: {logo_path}")
+    else:
+        print("Warning: logo.pdf not found, PDFs will be generated without watermark")
 
     # Read and organize the work data
     print("Reading work.csv...")
@@ -323,8 +501,8 @@ def main():
         safe_filename = person_name.replace("/", "-").replace("\\", "-")
         output_path = os.path.join(output_dir, f"{safe_filename}.pdf")
 
-        # Generate the PDF
-        create_pdf_for_person(person_name, header, work_rows, output_path)
+        # Generate the PDF with watermark
+        create_pdf_for_person(person_name, header, work_rows, output_path, logo_path)
 
     print(f"\n✓ Successfully generated {len(person_work)} PDFs in {output_dir}")
 

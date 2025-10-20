@@ -17,6 +17,8 @@ names.csv
 # Generated work allocation PDFs
 workAllotment/work/
 workAllotment/work.csv
+workAllotment/work.zip
+workAllotment/logo.png
 
 invites.zip
 
